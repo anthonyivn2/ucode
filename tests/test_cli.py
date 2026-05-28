@@ -1460,7 +1460,15 @@ class TestConfigureAgentsSelection:
         )
         captured: dict = {}
 
-        def fake_configure_shared_state(workspace, profile=None, tools=None, force_login=False):
+        def fake_configure_shared_state(
+            workspace,
+            profile=None,
+            tools=None,
+            force_login=False,
+            use_pat=False,
+            fable_enabled=None,
+            databricks_ai_tools_enabled=None,
+        ):
             captured["workspace"] = workspace
             captured["profile"] = profile
             return {**MINIMAL_STATE, "workspace": workspace, "profile": profile}
@@ -1469,6 +1477,7 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(cli_mod, "save_state", lambda state: None)
         monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: True)
         monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["claude"])
+        monkeypatch.setattr(cli_mod, "_maybe_select_provider_service", lambda tool, state: state)
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *args, **kwargs: True)
         monkeypatch.setattr(
             cli_mod,
