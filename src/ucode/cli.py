@@ -109,9 +109,9 @@ from ucode.usage import usage as usage_report
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
-    "codex": ("codex", "copilot", "pi"),
+    "codex": ("codex", "opencode", "copilot", "pi"),
     "gemini": ("gemini", "opencode", "pi"),
-    "oss": ("opencode",),
+    "oss": ("opencode", "pi"),
 }
 
 

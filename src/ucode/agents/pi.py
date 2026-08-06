@@ -1,6 +1,6 @@
 """Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
 
-Pi (https://pi.dev) is a multi-provider coding agent. We register three
+Pi (https://pi.dev) is a multi-provider coding agent. We register four
 providers in its `models.json`, each speaking the API dialect best suited to
 that family's gateway path:
 
@@ -9,7 +9,7 @@ that family's gateway path:
 - `databricks-gemini`  (api: google-generative-ai)     → /ai-gateway/gemini/v1beta
 - `databricks-oss`     (api: openai-responses)         → /ai-gateway/mlflow/v1
 
-Per-provider `compat` flags work around fields the gateway translators reject:
+One provider-specific `compat` flag works around a field the gateway translator rejects:
 
 - claude: `supportsEagerToolInputStreaming: false` — the Anthropic translator
   rejects `tools[].eager_input_streaming` on the streaming + tools path that
@@ -77,7 +77,7 @@ PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES
 
 # Old provider names earlier ucode versions wrote; cleaned up on each write so
 # users don't end up with stale entries pointing at routes that 400.
-LEGACY_PROVIDER_NAMES = ("databricks-anthropic", "databricks-codex", "databricks-kimi")
+LEGACY_PROVIDER_NAMES = ("databricks-anthropic", "databricks-codex")
 
 
 def is_update_available() -> tuple[str, str] | None:

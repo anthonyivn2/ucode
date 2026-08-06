@@ -1048,7 +1048,11 @@ class TestDiscoverGeminiModels:
                         ]
                     },
                 }
-                for name in ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+                for name in [
+                    "databricks-gpt-5-2-codex",
+                    "databricks-gpt-4-1",
+                    "databricks-gpt-oss-120b",
+                ]
             ]
         }
         monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))

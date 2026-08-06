@@ -371,12 +371,11 @@ class TestWriteToolConfig:
         providers = written.get("providers", {})
         assert providers.get("databricks-claude") != {"old": True}
         assert "old" not in providers.get("databricks-claude", {})
+        assert "databricks-oss" not in providers
         assert providers.get("user-provider") == {"keep": True}
 
     def test_legacy_providers_removed_on_upgrade(self, tmp_path, monkeypatch):
-        """Earlier ucode versions wrote `databricks-anthropic`, `databricks-codex`,
-        and `databricks-kimi` providers. They must be stripped on the next write
-        so users don't end up with stale entries pointing at routes that 400."""
+        """Old provider names are stripped on the next write."""
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
 
         config_file.write_text(
@@ -385,7 +384,6 @@ class TestWriteToolConfig:
                     "providers": {
                         "databricks-anthropic": {"api": "anthropic-messages"},
                         "databricks-codex": {"api": "openai-responses"},
-                        "databricks-kimi": {"api": "openai-responses"},
                     }
                 }
             ),
@@ -399,7 +397,7 @@ class TestWriteToolConfig:
             pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
 
         written_providers = json.loads(config_file.read_text()).get("providers", {})
-        for legacy in ("databricks-anthropic", "databricks-codex", "databricks-kimi"):
+        for legacy in ("databricks-anthropic", "databricks-codex"):
             assert legacy not in written_providers
         assert "databricks-claude" in written_providers
 

@@ -2001,6 +2001,19 @@ class TestConfigureSharedStateAlignedModelFamilies:
         assert state["gemini_models"] == ["system.ai.gemini-2-5-pro"]
         assert state["oss_models"] == ["system.ai.kimi-k2-7-code"]
 
+    def test_diagnostics_list_new_family_consumers(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        notes: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+        cli_mod._print_discovery_diagnostics(
+            {"_discovery_reasons": {"codex": "missing", "oss": "missing"}}
+        )
+
+        assert "needed for: codex, opencode, copilot, pi" in notes[0]
+        assert "needed for: opencode, pi" in notes[1]
+
 
 class TestConfigureSharedStateSkipDiscovery:
     """With skip_model_discovery (provider mode), the heavy family discovery is

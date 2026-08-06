@@ -2272,7 +2272,8 @@ def discover_gemini_models(workspace: str, token: str) -> tuple[list[str], str |
 
 
 def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | None]:
-    return discover_endpoints_with_api_type(workspace, token, "openai/v1/responses")
+    models, reason = discover_endpoints_with_api_type(workspace, token, "openai/v1/responses")
+    return [model for model in models if "gpt-oss-" not in model], reason
 
 
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
