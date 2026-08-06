@@ -55,6 +55,16 @@ from ucode.databricks import (
     resolve_pat_token,
     run_databricks_login,
 )
+from ucode.managed_config import (
+    load_managed_state,
+    managed_agent_config_enabled,
+    managed_launch_state,
+)
+from ucode.managed_resolve import (
+    managed_default_model,
+    managed_provider_service,
+    managed_supplies_models,
+)
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -1174,26 +1184,17 @@ def _launch_tool(
         if needs_auto_configure:
             _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
+        # Remembered before the fallback below collapses the two cases: a managed config may not
+        # silently override a provider the user typed on the command line (it errors instead).
+        explicit_provider = provider
         # An explicit --provider overrides the persisted choice; otherwise fall
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
-        if routing_agent is not None and enable_smart_routing_flag and provider:
-            raise RuntimeError(
-                f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
-                "--provider. Launch without a Model Provider Service and try again."
-            )
-        # Validate the provider service before launching — it must exist, be a
-        # provider type this tool can route to (e.g. claude can't use an OpenAI
-        # or Foundry service), and, for Bedrock, expose Claude models to pin.
-        # Surfaces a clear error up front instead of a cryptic gateway failure
-        # mid-session. For a Bedrock service this also returns the model ids.
-        provider_models = None
-        relayed = False
-        if provider:
-            provider_models, error, relayed = resolve_provider_models(tool, state, provider)
-            if error:
-                raise RuntimeError(error)
+        # Discovery exists to find models and isn't needed for managed config that already names them.
+        managed_models_known = managed_agent_config_enabled() and managed_supplies_models(
+            load_managed_state(state.get("workspace")), tool
+        )
         # Re-fetch model lists on every launch so newly-added Databricks
         # endpoints show up without a manual `ucode configure` (and so that
         # tools like pi which read multiple model bundles never run on
@@ -1203,9 +1204,67 @@ def _launch_tool(
             state["workspace"],
             profile=state.get("profile"),
             tools=[tool],
-            skip_model_discovery=bool(provider),
+            skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
         )
+        # An admin-published managed config wins over the developer's own settings. Resolved before
+        # the provider and model are settled below, so each is decided once against the values that
+        # will actually be written — the two state files are never merged on disk.
+        managed = None
+        if managed_agent_config_enabled():
+            # The spinner covers the read; the outcome is printed after it so the line survives
+            # (a spinner erases itself, leaving nothing to explain which settings won).
+            with spinner("Checking for a managed coding agent config..."):
+                state, managed = managed_launch_state(state, tool, skip_preflight=skip_preflight)
+            if managed is not None:
+                print_success("Applied your workspace's managed coding agent config")
+                # The enterprise scope outranks the --settings file ucode writes, so a model pinned
+                # there quietly beats the admin's — point at the file rather than let the mismatch
+                # look like a ucode bug.
+                if tool == "claude":
+                    overrides = claude_agent.managed_settings_model_overrides()
+                    if overrides is not None:
+                        print_warning(
+                            f"Default models are set in your enterprise managed settings at "
+                            f"{overrides}, which may override your admin's managed config."
+                        )
+            else:
+                print_note("No managed coding agent config found; using your own settings")
+        if managed is not None:
+            managed_provider = managed_provider_service(managed, tool)
+            if explicit_provider and managed_provider and managed_provider != explicit_provider:
+                # An explicit --provider that disagrees with the admin's is a hard error rather
+                # than a silent override: the user asked for something the managed config forbids,
+                # and quietly routing them elsewhere would hide it.
+                raise RuntimeError(
+                    f"You cannot launch {TOOL_SPECS[tool]['display']} with provider "
+                    f"{explicit_provider} because your admin has specified managed provider "
+                    f"{managed_provider}."
+                )
+            if managed_provider:
+                provider = managed_provider
+        # Checked after the managed config settles `provider`: an admin-set provider must trip this
+        # guard too, or routing would be persisted as on while a provider is active.
+        if routing_agent is not None and enable_smart_routing_flag and provider:
+            raise RuntimeError(
+                f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
+                "--provider. Launch without a Model Provider Service and try again."
+            )
+        # Validate the provider service before launching — it must exist, be a
+        # provider type this tool can route to (e.g. claude can't use an OpenAI
+        # or Foundry service), and, for Bedrock, expose Claude models to pin.
+        provider_models = None
+        relayed = False
+        if provider:
+            provider_models, error, relayed = resolve_provider_models(tool, state, provider)
+            if error:
+                if managed is not None and provider == managed_provider_service(managed, tool):
+                    # Clear error if the admin has Unity Catalog grants the developer doesn't.
+                    raise RuntimeError(
+                        f"Your admin's managed config specifies provider {provider} for "
+                        f"{TOOL_SPECS[tool]['display']}, which can't be used: {error}"
+                    )
+                raise RuntimeError(error)
         if routing_agent is not None and enable_smart_routing_flag:
             state = routing_agent.enable_smart_routing(state)
         # The router's per-launch pick for the root session. Codex pins it as the
@@ -1218,7 +1277,12 @@ def _launch_tool(
             # the workspace has no matching Databricks models.
             resolved_model = None
         else:
-            state, resolved_model = resolve_launch_model(tool, state, None)
+            # A managed default_model is the model the admin wants sessions to start on, so it goes
+            # in as the explicit model rather than being applied afterwards: for codex the proto has
+            # no model list at all, so passing it here is the only way a launch succeeds when the
+            # workspace's own discovery turned up nothing.
+            managed_model = managed_default_model(managed, tool) if managed is not None else None
+            state, resolved_model = resolve_launch_model(tool, state, managed_model)
             if routing_agent is not None and routing_agent.smart_routing_enabled(state):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
@@ -1235,6 +1299,14 @@ def _launch_tool(
                     print_warning(
                         f"Smart routing was unavailable ({routing_error}); using {resolved_model}."
                     )
+            # The admin's model outranks a smart-routing pick too. Claude only launches on it when
+            # pinned as ANTHROPIC_MODEL (route_root_model); other agents take `resolved_model`,
+            # which already holds it from resolve_launch_model above.
+            if managed_model:
+                if tool == "claude":
+                    route_root_model = managed_model
+                else:
+                    resolved_model = managed_model
         state = configure_tool(
             tool,
             state,
@@ -1245,6 +1317,8 @@ def _launch_tool(
             route_root_model=route_root_model,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
+        if managed is not None:
+            print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
         elif route_root_model:
