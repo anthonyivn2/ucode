@@ -33,7 +33,7 @@ from ucode.agents import (
 )
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import restore_file, set_dry_run
+from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -49,22 +49,35 @@ from ucode.databricks import (
     get_databricks_token,
     install_databricks_cli,
     is_model_provider_feature_unavailable,
+    is_workspace_admin,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
     resolve_pat_token,
     run_databricks_login,
 )
+from ucode.managed_budget import (
+    budget_usage_percent,
+    recommendation_line,
+    render_budget_panel,
+)
 from ucode.managed_config import (
+    get_model_recommendation,
     load_managed_state,
     managed_agent_config_enabled,
-    managed_launch_state,
+    refresh_managed_config,
 )
 from ucode.managed_resolve import (
     managed_default_model,
+    managed_enabled_tools,
+    managed_launch_model,
     managed_provider_service,
     managed_supplies_models,
+    managed_unservable_models,
+    recommended_agent,
+    resolve_state,
 )
+from ucode.managed_wizard import setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -113,6 +126,87 @@ _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini", "opencode", "pi"),
     "oss": ("opencode", "pi"),
 }
+
+
+def _policy_summary_lines(managed: dict) -> list[str]:
+    """Rich-markup lines describing the admin's budget policy, or empty when it sets none."""
+    policy = managed.get("budget_policy")
+    if not isinstance(policy, dict):
+        return []
+    name = str(policy.get("display_name") or "coding-agents-default")
+    lines = [f"[bold]Policy:[/bold] [cyan]{name}[/cyan]"]
+    tiers = policy.get("tiers")
+    for tier in tiers if isinstance(tiers, list) else []:
+        if not isinstance(tier, dict):
+            continue
+        pct_raw = tier.get("spending_percentage")
+        pct = (
+            f"{float(pct_raw) * 100:g}%"
+            if isinstance(pct_raw, int | float) and not isinstance(pct_raw, bool)
+            else "?"
+        )
+        # A tier whose agent enum this build doesn't know is dropped during normalization, so it
+        # arrives unset rather than as a tool name TOOL_SPECS could resolve.
+        agent = tier.get("default_agent")
+        agent_display = TOOL_SPECS[agent]["display"] if agent in TOOL_SPECS else "?"
+        model = str(tier.get("default_model") or "?")
+        lines.append(
+            f"  [dim]·[/dim] [bold]at {pct}[/bold] → {agent_display} · [magenta]{model}[/magenta]"
+        )
+    return lines
+
+
+def _print_managed_summary(managed: dict, state: dict, tool: str) -> None:
+    """Show the developer which of their admin's settings are in force for this launch."""
+    lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
+    lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
+    enabled = [t for t in (managed.get("enabled_agents") or {}) if t in TOOL_SPECS]
+    if enabled:
+        lines.append(
+            f"[bold]Enabled agents:[/bold] {', '.join(TOOL_SPECS[t]['display'] for t in enabled)}"
+        )
+    provider = managed_provider_service(managed, tool)
+    if provider:
+        lines.append(f"[bold]Provider:[/bold] [magenta]{provider}[/magenta]")
+    model = managed_default_model(managed, tool)
+    if model:
+        lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
+    # Always listed, including when empty: "none configured" tells a developer their admin set none,
+    # which a missing row leaves ambiguous. Shown as the admin configured them — registering them
+    # locally is a separate change, hence "pending".
+    mcp_names = [
+        str(server.get("name"))
+        for server in (managed.get("mcp_servers") or [])
+        if isinstance(server, dict) and server.get("name")
+    ]
+    if mcp_names:
+        lines.append(f"[bold]MCPs:[/bold] {', '.join(mcp_names)} [dim](pending)[/dim]")
+    else:
+        lines.append("[bold]MCPs:[/bold] [dim]none configured[/dim]")
+    skill_names = [str(name) for name in ((managed.get("skills") or {}).get("names") or []) if name]
+    if skill_names:
+        lines.append(f"[bold]Skills:[/bold] {', '.join(skill_names)} [dim](pending)[/dim]")
+    else:
+        lines.append("[bold]Skills:[/bold] [dim]none configured[/dim]")
+    lines.extend(_policy_summary_lines(managed))
+    console.print(
+        Panel("\n".join(lines), title="Workspace-managed config", style="green", expand=False)
+    )
+
+
+def _reject_configure_under_managed_config() -> None:
+    """Refuse ``ucode configure`` when the workspace publishes a managed config.
+
+    Configuring locally would be overridden at launch anyway, so it is an error rather than a
+    silently-ignored run. Without a managed config the command still runs unchanged.
+    """
+    if not managed_agent_config_enabled():
+        return
+    if load_managed_state(load_state().get("workspace")):
+        raise RuntimeError(
+            "The ucode configure command is being deprecated. Please run `ucode` to launch "
+            "with your admin's managed config applied"
+        )
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -548,7 +642,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         return _use_databricks()
     if not names:
         # Feature is on but no service matches this tool's provider type.
-        print_note(f"No model provider services available for {display}; using Databricks models.")
+        print_note(f"Using Databricks models for {display}.")
         return _use_databricks()
 
     choice = prompt_for_selection(
@@ -867,13 +961,25 @@ def revert() -> int:
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
+app.add_typer(
+    setup_app, name="setup", help="Author the workspace's managed coding config (admins only)."
+)
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        from ucode.telemetry import ucode_version
+
+        print(ucode_version())
+        raise typer.Exit()
 
 
 @mcp_app.command("web-search")
@@ -1157,6 +1263,106 @@ _ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
 _ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
 
 
+def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
+    """Refuse to launch ``tool`` when the managed config enables other agents but not this one.
+
+    ``enabled_agents`` is an allowlist: launching an agent the admin didn't enable would run
+    unmanaged, with none of their models or provider applied. A config that names no agents at all
+    expresses no opinion, so it blocks nothing.
+    """
+    enabled = managed_enabled_tools(managed or {})
+    if enabled and tool not in enabled:
+        names = ", ".join(TOOL_SPECS[name]["display"] for name in enabled)
+        raise RuntimeError(
+            f"Your workspace's managed config doesn't enable {TOOL_SPECS[tool]['display']}. "
+            f"Enabled: {names}."
+        )
+
+
+def _fetch_managed_config(state: dict, *, skip_preflight: bool) -> dict | None:
+    """The workspace's managed config for this launch, or None when there is none.
+
+    ``skip_preflight`` mirrors the launch flag: it reads the last persisted copy instead of
+    re-fetching, so the config can be stale until a normal launch refreshes it.
+    """
+    if not managed_agent_config_enabled():
+        return None
+    if skip_preflight:
+        return load_managed_state(state.get("workspace")) or None
+    with spinner("Checking for a managed coding agent config..."):
+        return refresh_managed_config(state)
+
+
+def _note_recommended_agent(recommendation: dict | None, tool: str) -> None:
+    """Say when the budget tier points at a different agent than the one being launched.
+
+    Launching any enabled agent is allowed, so this informs rather than blocks — and explains why
+    the session is not on the tier's model.
+    """
+    # The tier's own agent, not `recommended_agent`'s default_agent fallback: there is nothing to
+    # say when the config's baseline simply differs from what the developer asked for.
+    agent = (recommendation or {}).get("agent")
+    if agent == tool or agent not in TOOL_SPECS:
+        return
+    model = (recommendation or {}).get("model")
+    suffix = f" with {model}" if isinstance(model, str) and model else ""
+    print_note(
+        f"Your budget tier recommends {TOOL_SPECS[agent]['display']}{suffix}; "
+        f"launching {TOOL_SPECS[tool]['display']} as requested."
+    )
+
+
+def _fetch_budget_recommendation(
+    state: dict, managed: dict | None, *, skip_preflight: bool
+) -> dict | None:
+    """The agent and model the caller's budget tier allows, or None when there is no budget to read.
+
+    Enforcement is server-side, so a failed read only costs the recommendation: the config's own
+    ``default_model`` still applies and the launch proceeds.
+    """
+    # --dry-run resolves the agent from the last saved config alone, so it must not reach the
+    # control plane — mirroring the managed-config read, which is likewise skipped under --dry-run.
+    if managed is None or skip_preflight or is_dry_run():
+        return None
+    reason: str | None = None
+    recommendation = None
+    with spinner("Checking your budget..."):
+        try:
+            recommendation, reason = get_model_recommendation(
+                state["workspace"],
+                get_databricks_token(state["workspace"], state.get("profile")),
+            )
+        except (RuntimeError, OSError) as exc:
+            # A token that lapsed since the config refresh — or a Databricks CLI that isn't
+            # installed or reachable — must not block the launch; the config's default_model stands.
+            reason = str(exc)
+    if reason is not None:
+        print_warning(
+            f"Could not check your budget ({reason}); "
+            "using the default model from your workspace's config."
+        )
+    return recommendation
+
+
+def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:
+    """Show the workspace budget this launch spends against, when one is configured."""
+    agent = recommendation.get("agent")
+    display_agent = TOOL_SPECS[agent]["display"] if agent in TOOL_SPECS else None
+    percent = budget_usage_percent(
+        float(recommendation.get("current_spend") or 0.0),
+        float(recommendation.get("effective_threshold") or 0.0),
+    )
+    line = recommendation_line(display_agent, recommendation.get("model"), percent)
+    panel = render_budget_panel(
+        recommendation,
+        title=f"ucode with {TOOL_SPECS[tool]['display']}",
+        extra_lines=[line] if line else None,
+        managed=managed,
+    )
+    if panel is not None:
+        console.print(panel)
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1164,6 +1370,8 @@ def _launch_tool(
     skip_preflight: bool = False,
     workspace: str | None = None,
     enable_smart_routing_flag: bool = False,
+    managed: dict | None = None,
+    recommendation: dict | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -1191,10 +1399,16 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
+        # Fetched before `configure_shared_state` because it decides whether this agent may launch
+        # at all and whether the model discovery below can be skipped.
+        # Bare `ucode` already fetched one to choose the agent; refetching would double the
+        # control-plane round trip and any fallback warning it printed.
+        if managed is None:
+            managed = _fetch_managed_config(state, skip_preflight=skip_preflight)
+        # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
+        _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
-        managed_models_known = managed_agent_config_enabled() and managed_supplies_models(
-            load_managed_state(state.get("workspace")), tool
-        )
+        managed_models_known = managed_supplies_models(managed, tool)
         # Re-fetch model lists on every launch so newly-added Databricks
         # endpoints show up without a manual `ucode configure` (and so that
         # tools like pi which read multiple model bundles never run on
@@ -1207,29 +1421,36 @@ def _launch_tool(
             skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
         )
-        # An admin-published managed config wins over the developer's own settings. Resolved before
-        # the provider and model are settled below, so each is decided once against the values that
-        # will actually be written — the two state files are never merged on disk.
-        managed = None
-        if managed_agent_config_enabled():
-            # The spinner covers the read; the outcome is printed after it so the line survives
-            # (a spinner erases itself, leaving nothing to explain which settings won).
-            with spinner("Checking for a managed coding agent config..."):
-                state, managed = managed_launch_state(state, tool, skip_preflight=skip_preflight)
-            if managed is not None:
-                print_success("Applied your workspace's managed coding agent config")
-                # The enterprise scope outranks the --settings file ucode writes, so a model pinned
-                # there quietly beats the admin's — point at the file rather than let the mismatch
-                # look like a ucode bug.
-                if tool == "claude":
-                    overrides = claude_agent.managed_settings_model_overrides()
-                    if overrides is not None:
-                        print_warning(
-                            f"Default models are set in your enterprise managed settings at "
-                            f"{overrides}, which may override your admin's managed config."
-                        )
-            else:
-                print_note("No managed coding agent config found; using your own settings")
+        # An admin-published managed config wins over the developer's own settings. Layered on after
+        # `configure_shared_state`, whose returned state it overrides, and before the provider and
+        # model are settled below — the two state files are never merged on disk.
+        # Bare `ucode` already read one to choose the agent; refetching would double the round trip.
+        if recommendation is None:
+            recommendation = _fetch_budget_recommendation(
+                state, managed, skip_preflight=skip_preflight
+            )
+        _note_recommended_agent(recommendation, tool)
+        if managed is not None:
+            state = resolve_state(managed, state, tool)
+            print_success("Applied your workspace's managed coding agent config")
+            unservable = managed_unservable_models(managed, tool)
+            if unservable:
+                print_warning(
+                    f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
+                    f"models ({', '.join(unservable)}); using your discovered models instead."
+                )
+            # The enterprise scope outranks the --settings file ucode writes, so a model pinned
+            # there quietly beats the admin's — point at the file rather than let the mismatch
+            # look like a ucode bug.
+            if tool == "claude":
+                overrides = claude_agent.managed_settings_model_overrides()
+                if overrides is not None:
+                    print_warning(
+                        f"Default models are set in your enterprise managed settings at "
+                        f"{overrides}, which may override your admin's managed config."
+                    )
+        elif managed_agent_config_enabled():
+            print_note("No managed coding agent config found; using your own settings")
         if managed is not None:
             managed_provider = managed_provider_service(managed, tool)
             if explicit_provider and managed_provider and managed_provider != explicit_provider:
@@ -1281,7 +1502,9 @@ def _launch_tool(
             # in as the explicit model rather than being applied afterwards: for codex the proto has
             # no model list at all, so passing it here is the only way a launch succeeds when the
             # workspace's own discovery turned up nothing.
-            managed_model = managed_default_model(managed, tool) if managed is not None else None
+            managed_model = (
+                managed_launch_model(managed, recommendation, tool) if managed is not None else None
+            )
             state, resolved_model = resolve_launch_model(tool, state, managed_model)
             if routing_agent is not None and routing_agent.smart_routing_enabled(state):
                 display = TOOL_SPECS[tool]["display"]
@@ -1341,6 +1564,8 @@ def _launch_tool(
                 f"{TOOL_SPECS[tool]['display']} token refresh is managed automatically "
                 f"every 30 minutes while the session is running."
             )
+        if recommendation is not None:
+            _print_budget_panel(recommendation, tool, managed)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
@@ -1360,7 +1585,8 @@ SkipPreflightOption = Annotated[
     typer.Option(
         "--skip-preflight",
         help="Skip the per-launch Databricks auth + AI Gateway re-validation, trusting a "
-        "prior `ucode configure`.",
+        "prior `ucode configure`. Launches with your own local settings, ignoring any "
+        "workspace managed config.",
     ),
 ]
 
@@ -1374,6 +1600,134 @@ WorkspaceOption = Annotated[
         "if not already configured.",
     ),
 ]
+
+
+@app.callback(invoke_without_command=True)
+def default(
+    ctx: typer.Context,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            help="Show the ucode version and exit.",
+            callback=_version_callback,
+            is_eager=True,
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print config files without writing them. Uses the last saved managed "
+            "config instead of fetching a fresh one.",
+        ),
+    ] = False,
+    skip_preflight: SkipPreflightOption = False,
+    workspace: WorkspaceOption = None,
+) -> None:
+    """Configure and launch coding agents through Databricks AI Gateway.
+
+    With no subcommand, launches the agent your workspace's managed config selects.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    set_dry_run(dry_run)
+    try:
+        _launch_managed_default(
+            ctx, dry_run=dry_run, skip_preflight=skip_preflight, workspace=workspace
+        )
+    except typer.Exit:
+        # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
+        # below. Otherwise a launch that already reported its own error is followed by
+        # `print_err(str(exc))` printing the exit code — a bare, meaningless "ERROR 1".
+        raise
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+
+
+def _launch_managed_default(
+    ctx: typer.Context,
+    *,
+    dry_run: bool,
+    skip_preflight: bool,
+    workspace: str | None,
+) -> None:
+    """Route bare ``ucode`` by whether the workspace publishes a managed config."""
+    if not managed_agent_config_enabled():
+        console.print(ctx.get_help())
+        return
+    if workspace:
+        set_current_workspace(normalize_workspace_url(workspace))
+    install_databricks_cli()
+    state = load_state()
+    current = state.get("workspace")
+    if not current:
+        raise RuntimeError("No workspace configured. Run `ucode configure` first.")
+    apply_pat_environment(state)
+    if skip_preflight:
+        # Deliberately unmanaged, so no config is read at all — and there is none to name an agent.
+        raise RuntimeError(
+            "--skip-preflight launches with your own settings, so `ucode` has no managed config "
+            "to pick an agent from. Run `ucode <agent> --skip-preflight` instead."
+        )
+    # --dry-run avoids the fetch but still applies the last saved config.
+    if dry_run:
+        managed = load_managed_state(current)
+    else:
+        with spinner("Checking for a managed coding agent config..."):
+            managed = refresh_managed_config(state)
+    if not managed:
+        # Only a read that actually reached the workspace can say it publishes no config. Under
+        # --dry-run nothing was fetched, so an empty cache means "not pulled yet" — reporting that
+        # as "no config" would tell an admin their own published config doesn't exist.
+        if dry_run:
+            print_warning(
+                "No managed coding agent config is saved locally yet, so there is nothing to "
+                "dry-run. Run `ucode` without --dry-run to pull your workspace's config first."
+            )
+            return
+        _print_no_managed_config_guidance(current, state.get("profile"))
+        return
+    # The budget tier can move the org to a cheaper agent, so it outranks the config's
+    # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
+    recommendation = _fetch_budget_recommendation(state, managed, skip_preflight=skip_preflight)
+    tool = recommended_agent(recommendation, managed) or next(
+        iter(managed.get("enabled_agents") or {}), None
+    )
+    if not isinstance(tool, str) or not tool:
+        raise RuntimeError(
+            "Your workspace's managed config names no agent to launch. Ask an admin to set a "
+            "default agent, or run `ucode <agent>` directly."
+        )
+    _print_managed_summary(managed, state, tool)
+    _launch_tool(
+        tool,
+        ctx,
+        skip_preflight=skip_preflight,
+        workspace=workspace,
+        managed=managed,
+        recommendation=recommendation,
+    )
+
+
+def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> None:
+    """Tell an admin how to publish a config, and everyone else who to ask."""
+    print_warning(
+        "No managed coding agent config was found for this workspace; using your local settings."
+    )
+    try:
+        token = get_databricks_token(workspace, profile)
+    except RuntimeError:
+        return
+    with spinner("Checking your workspace permissions..."):
+        is_admin = is_workspace_admin(workspace, token)
+    if is_admin is False:
+        print_note("Ask a workspace admin to set one up with `ucode setup`.")
+    else:
+        # None means the admin check itself failed; point at setup rather than a dead end.
+        print_note("Run `ucode setup` to configure one for your workspace, then `ucode apply`.")
 
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1653,6 +2007,7 @@ def configure(
     prompt_optional_updates = not skip_upgrade
     try:
         install_databricks_cli()
+        _reject_configure_under_managed_config()
         if agent is not None and agents is not None:
             raise RuntimeError("Use either --agent or --agents, not both.")
         if workspaces is not None and profiles is not None:
@@ -1939,6 +2294,53 @@ def configure_tracing(
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+
+
+@setup_app.callback(invoke_without_command=True)
+def setup(
+    ctx: typer.Context,
+    from_file: Annotated[
+        str | None,
+        typer.Option(
+            "--from-file",
+            help="Skip the interactive flow and load a hand-written managed config (JSON, in "
+            "ucode's manifest shape) instead. Validated before it is saved.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Walk the flow without writing any files."),
+    ] = False,
+) -> None:
+    """Author the managed coding config for your workspace (workspace admins only)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    set_dry_run(dry_run)
+    # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
+    # `except RuntimeError` below would swallow it and report the exit code as an error message.
+    try:
+        install_databricks_cli()
+        code = setup_command(from_file=from_file)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("show")
+def setup_show_cmd() -> None:
+    """Print the authored managed config and the payload `ucode apply` would publish."""
+    try:
+        code = show_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    if code:
+        raise typer.Exit(code)
 
 
 @app.command("status")

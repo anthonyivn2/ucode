@@ -12,7 +12,6 @@ import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
     load_managed_state,
-    managed_launch_state,
     normalize_managed_config,
     refresh_managed_config,
     save_managed_state,
@@ -395,85 +394,70 @@ class TestRefreshManagedConfig:
         assert refresh_managed_config({}) is None
 
 
-class TestManagedLaunchState:
-    @pytest.fixture(autouse=True)
-    def _stub_token(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda ws, profile: "tok")
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
-        monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, "1")
+class TestGetModelRecommendation:
+    """The budget recommendation read. Every response field is optional server-side."""
 
-    def test_layers_managed_models_when_a_config_exists(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed == MANAGED
-        assert resolved["claude_models"]["opus"] == "system.ai.claude-opus-5"
-        # The developer's own state is untouched — precedence is resolved in memory.
-        assert state["claude_models"]["opus"] == "local-opus"
+    @staticmethod
+    def _stub(monkeypatch, payload, reason=None):
+        monkeypatch.setattr(mc_mod, "fetch_model_recommendation", lambda ws, tok: (payload, reason))
 
-    def test_state_untouched_when_no_managed_config(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed is None
-        assert resolved is state
-
-    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
-    def test_disabled_does_nothing_at_all(self, monkeypatch, env_value):
-        """While the feature is opt-in, a disabled launch must behave exactly as it did before.
-
-        Every side effect the managed path can have is trip-wired, so this fails if any future
-        change reaches the network, the cache, or the developer's state without the env var set.
-        """
-        if env_value is None:
-            monkeypatch.delenv(mc_mod.MANAGED_CONFIG_ENV_VAR, raising=False)
-        else:
-            monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, env_value)
-        for name in (
-            "get_databricks_token",
-            "fetch_managed_coding_agent_configs",
-            "get_managed_config",
-            "load_managed_state",
-            "save_managed_state",
-            "resolve_state",
-            "print_warning",
-        ):
-            monkeypatch.setattr(
-                mc_mod,
-                name,
-                lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
-            )
-
-        assert mc_mod.managed_agent_config_enabled() is False
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed is None
-        # Same object back, so nothing downstream can see a layered value.
-        assert resolved is state
-        assert state["claude_models"] == {"opus": "local-opus"}
-
-    @pytest.mark.parametrize("env_value", ["1", "true", "TRUE", "yes"])
-    def test_enabled_values(self, monkeypatch, env_value):
-        monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, env_value)
-        assert mc_mod.managed_agent_config_enabled() is True
-
-    def test_skip_preflight_reads_the_cache_without_fetching(self, monkeypatch):
-        # Headless launchers pass --skip-preflight to avoid per-launch network calls, so the config
-        # comes from the last persisted copy rather than a fresh read.
-        monkeypatch.setattr(
-            mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
+    def test_normalizes_agent_model_and_spend(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "recommended_agent": "CODING_AGENT_OPENCODE",
+                "recommended_model": "system.ai.claude-haiku-4-5",
+                "current_spend": "412.50",
+                "effective_threshold": "500.00",
+            },
         )
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
-        resolved, managed = managed_launch_state(_state(), "claude", skip_preflight=True)
-        assert managed == MANAGED
-        assert resolved["claude_models"]["opus"] == "system.ai.claude-opus-5"
+        rec, reason = mc_mod.get_model_recommendation("https://w", "tok")
+        assert reason is None
+        assert rec == {
+            "agent": "opencode",
+            "model": "system.ai.claude-haiku-4-5",
+            "current_spend": 412.5,
+            "effective_threshold": 500.0,
+        }
 
-    def test_skip_preflight_with_no_cache_is_a_noop(self, monkeypatch):
-        monkeypatch.setattr(
-            mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
+    def test_model_without_an_agent(self, monkeypatch):
+        # A model-only tier with no default_agent recommends a model but no agent.
+        self._stub(monkeypatch, {"recommended_model": "system.ai.gpt-5", "current_spend": "1.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["agent"] is None and rec["model"] == "system.ai.gpt-5"
+
+    def test_agent_without_a_model(self, monkeypatch):
+        self._stub(monkeypatch, {"recommended_agent": "CODING_AGENT_PI", "current_spend": "1.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["agent"] == "pi" and rec["model"] is None
+
+    @pytest.mark.parametrize("agent_enum", ["CODING_AGENT_UNSPECIFIED", "CODING_AGENT_FUTURE", ""])
+    def test_unknown_agent_is_dropped_not_fatal(self, monkeypatch, agent_enum):
+        self._stub(
+            monkeypatch,
+            {"recommended_agent": agent_enum, "recommended_model": "m", "current_spend": "1.00"},
         )
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
-        state = _state()
-        resolved, managed = managed_launch_state(state, "claude", skip_preflight=True)
-        assert managed is None
-        assert resolved is state
+        rec, reason = mc_mod.get_model_recommendation("https://w", "tok")
+        assert reason is None
+        assert rec is not None and rec["agent"] is None and rec["model"] == "m"
+
+    def test_threshold_alone_still_reports(self, monkeypatch):
+        # A budget with no spend yet still has a threshold worth showing.
+        self._stub(monkeypatch, {"effective_threshold": "500.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["effective_threshold"] == 500.0
+
+    def test_empty_response_is_no_recommendation(self, monkeypatch):
+        self._stub(monkeypatch, {})
+        assert mc_mod.get_model_recommendation("https://w", "tok") == (None, None)
+
+    def test_failed_read_surfaces_the_reason(self, monkeypatch):
+        self._stub(monkeypatch, {}, reason="HTTP 500")
+        assert mc_mod.get_model_recommendation("https://w", "tok") == (None, "HTTP 500")
+
+    def test_unparseable_decimals_become_none(self, monkeypatch):
+        self._stub(
+            monkeypatch, {"recommended_agent": "CODING_AGENT_PI", "current_spend": "not-a-number"}
+        )
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["current_spend"] is None

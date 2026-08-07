@@ -8,9 +8,11 @@ An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; 
 - persisting it to ``~/.ucode/managed-state.json`` (0600), and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-:func:`managed_launch_state` is the launch path's entry point: it refreshes the manifest and hands
-back the state to configure the agent with. Deciding *which* value wins for a given key is
-:mod:`ucode.managed_resolve`'s job, kept separate so that logic stays pure and I/O-free.
+:func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
+because the manifest decides whether that discovery is needed at all; the launch path then hands the
+manifest to :func:`ucode.managed_resolve.resolve_state` once the state it layers over is final.
+Deciding *which* value wins for a given key is :mod:`ucode.managed_resolve`'s job, kept separate so
+that logic stays pure and I/O-free.
 """
 
 from __future__ import annotations
@@ -21,9 +23,12 @@ from pathlib import Path
 from typing import cast
 
 import ucode.config_io as config_io
-from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
-from ucode.managed_resolve import resolve_state
-from ucode.ui import print_warning
+from ucode.databricks import (
+    fetch_managed_coding_agent_configs,
+    fetch_model_recommendation,
+    get_databricks_token,
+)
+from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
 
@@ -36,8 +41,10 @@ MANAGED_CONFIG_ENV_VAR = "ENABLE_MANAGED_AGENT_CONFIG"
 NO_MANAGED_CONFIG_MESSAGE = "No coding-agent config has been set up by your workspace admin yet."
 
 # CodingAgent proto enum -> ucode tool name. Anything unrecognized (e.g. a newer agent this ucode
-# build doesn't know) is dropped during normalization rather than guessed at.
-_AGENT_ENUM_TO_TOOL: dict[str, str] = {
+# build doesn't know) is dropped during normalization rather than guessed at. Public because the
+# admin-write side (``managed_setup``) inverts these maps to serialize, so a new agent or MCP type
+# only has to be declared once.
+AGENT_ENUM_TO_TOOL: dict[str, str] = {
     "CODING_AGENT_CLAUDE_CODE": "claude",
     "CODING_AGENT_CODEX": "codex",
     "CODING_AGENT_GEMINI": "gemini",
@@ -48,7 +55,7 @@ _AGENT_ENUM_TO_TOOL: dict[str, str] = {
 
 # McpServerType proto enum -> ucode's short type tag. Mirrors the selection prefixes in ``mcp.py``;
 # the actual name->URL resolution happens there when the manifest is applied (a later change).
-_MCP_TYPE_ENUM_TO_TAG: dict[str, str] = {
+MCP_TYPE_ENUM_TO_TAG: dict[str, str] = {
     "MCP_SERVER_TYPE_UC_SERVICE": "mcp-service",
     "MCP_SERVER_TYPE_EXTERNAL": "external",
     "MCP_SERVER_TYPE_GENIE": "genie-space",
@@ -130,7 +137,7 @@ def _normalize_enabled_agent(entry: object) -> tuple[str, dict] | None:
     entry_dict = _as_dict(entry)
     if not entry_dict:
         return None
-    tool = _AGENT_ENUM_TO_TOOL.get(_str(entry_dict.get("agent")) or "")
+    tool = AGENT_ENUM_TO_TOOL.get(_str(entry_dict.get("agent")) or "")
     if tool is None:
         return None
     config_in = _as_dict(entry_dict.get("config"))
@@ -165,7 +172,7 @@ def _normalize_mcp_servers(value: object) -> list[dict]:
     for entry in value:
         entry_dict = _as_dict(entry)
         name = _str(entry_dict.get("name"))
-        tag = _MCP_TYPE_ENUM_TO_TAG.get(_str(entry_dict.get("type")) or "")
+        tag = MCP_TYPE_ENUM_TO_TAG.get(_str(entry_dict.get("type")) or "")
         if name and tag:
             out.append({"name": name, "type": tag})
     return out
@@ -190,7 +197,7 @@ def _normalize_budget_policy(value: object) -> dict | None:
         if not isinstance(pct, (int, float)) or isinstance(pct, bool):
             continue
         tier_out: dict = {"spending_percentage": float(pct)}
-        agent = _AGENT_ENUM_TO_TOOL.get(_str(tier_dict.get("default_agent")) or "")
+        agent = AGENT_ENUM_TO_TOOL.get(_str(tier_dict.get("default_agent")) or "")
         if agent:
             tier_out["default_agent"] = agent
         model = _str(tier_dict.get("default_model"))
@@ -213,7 +220,7 @@ def normalize_managed_config(raw: dict) -> dict:
     name = _str(raw.get("name"))
     if name:
         result["name"] = name
-    default_agent = _AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
+    default_agent = AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
     if default_agent:
         result["default_agent"] = default_agent
     enabled_agents: dict[str, dict] = {}
@@ -238,6 +245,42 @@ def normalize_managed_config(raw: dict) -> dict:
     if budget_policy is not None:
         result["budget_policy"] = budget_policy
     return result
+
+
+def _decimal(value: object) -> float | None:
+    """Parse one of the API's decimal-string money fields, or None when absent/unparseable."""
+    text = _str(value)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_model_recommendation(workspace: str, token: str) -> tuple[dict | None, str | None]:
+    """Fetch the agent and model the caller's budget tier allows, normalized for the launch path.
+
+    Returns ``(recommendation, reason)`` where the recommendation is ``{"agent", "model",
+    "current_spend", "effective_threshold"}``. Every field is optional server-side, so each is
+    normalized independently: an agent this build doesn't recognize is dropped rather than failing
+    the read, and a model can arrive without an agent.
+    """
+    payload, reason = fetch_model_recommendation(workspace, token)
+    if reason is not None:
+        return None, reason
+    agent = AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
+    model = _str(payload.get("recommended_model"))
+    spend = _decimal(payload.get("current_spend"))
+    threshold = _decimal(payload.get("effective_threshold"))
+    if agent is None and model is None and spend is None and threshold is None:
+        return None, None
+    return {
+        "agent": agent,
+        "model": model,
+        "current_spend": spend,
+        "effective_threshold": threshold,
+    }, None
 
 
 def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | None]:
@@ -298,9 +341,13 @@ def save_managed_state(workspace: str, config: dict) -> None:
     file doubles as the fallback when a later read fails: without it, removing a config server-side
     would leave the old one on disk to be reapplied after a transient outage.
     """
-    if config_io.is_dry_run():
-        return
     payload = {"workspace": workspace, "config": config}
+    if config_io.is_dry_run():
+        # Print rather than write, matching how the agent config writers behave under --dry-run.
+        console.print(
+            f"\n[bold]\\[dry run] {MANAGED_STATE_PATH}[/bold]\n{json.dumps(payload, indent=2)}\n"
+        )
+        return
     config_io.ensure_parent_dir(MANAGED_STATE_PATH)
     try:
         MANAGED_STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -424,27 +471,3 @@ def managed_agent_config_enabled() -> bool:
     Opt-in while the feature is being bug-bashed: without the env var set, launches behave exactly
     as they did before and never read the workspace's config."""
     return os.environ.get(MANAGED_CONFIG_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
-
-
-def managed_launch_state(
-    state: dict, tool: str, *, skip_preflight: bool = False
-) -> tuple[dict, dict | None]:
-    """Return ``(state, managed)`` for launching ``tool`` under any managed config.
-
-    The returned state has the manifest's models and provider layered over the developer's own —
-    managed wins per key — so the settings file written from it reflects the admin's choices. When
-    the workspace has no managed config the state is handed back untouched.
-
-    ``skip_preflight`` mirrors the launch flag: managed/headless launchers pass it to avoid
-    per-launch network calls, so the config is read from the last persisted copy instead of being
-    re-fetched (which means it can be arbitrarily stale until a normal launch refreshes it).
-    """
-    if not managed_agent_config_enabled():
-        return state, None
-    if skip_preflight:
-        managed = load_managed_state(state.get("workspace")) or None
-    else:
-        managed = refresh_managed_config(state)
-    if managed is None:
-        return state, None
-    return resolve_state(managed, state, tool), managed
