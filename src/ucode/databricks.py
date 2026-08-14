@@ -1428,6 +1428,10 @@ def _model_service_id(service: dict) -> str | None:
 _MODEL_SERVICES_PAGE_SIZE = 100
 _MODEL_SERVICES_PAGE_RETRIES = 4
 
+# Substrings that mark a failure reason (`HTTP <code> <phrase>: <body>`) as a 404 / NOT_FOUND:
+# the HTTP status line and the Databricks `error_code` carried in the response body.
+_NOT_FOUND_REASON_MARKERS = ("http 404", "not_found")
+
 
 def _get_model_services_page(
     url: str, token: str, *, retries: int = _MODEL_SERVICES_PAGE_RETRIES
@@ -1544,6 +1548,74 @@ def list_model_services(
             _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def _is_not_found_reason(reason: str | None) -> bool:
+    """True when an HTTP reason describes a 404 / NOT_FOUND (a resource that isn't there)."""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _NOT_FOUND_REASON_MARKERS)
+
+
+def model_service_exists(
+    workspace: str, token: str, full_name: str, *, max_pages: int = 100
+) -> tuple[bool | None, str | None]:
+    """Whether ``<catalog>.<schema>.<model>`` is a UC model service on this workspace.
+
+    Used to quick-check a hand-typed custom model before an admin pins a config to it. Lists the
+    model services in the typed name's own schema (``parent=schemas/<catalog>.<schema>``, the same
+    scoped listing :func:`list_model_services` uses for ``system.ai``) and checks for the name.
+
+    Returns ``(exists, reason)``:
+
+    - ``True`` — the name is a model service in that schema.
+    - ``False`` — the schema exists but has no such service, or the API returned 404/NOT_FOUND (the
+      catalog or schema in the name doesn't exist, so the model can't either). Both are a definitive
+      "no" the caller can re-prompt on.
+    - ``None`` — the check couldn't run: a name that isn't a three-part UC path, or a non-404
+      HTTP/network error. The caller treats this as "couldn't verify" rather than "doesn't exist" so
+      a transient failure never blocks a valid model.
+
+    Never cached: it targets a user schema, not the memoized ``system.ai`` walk.
+    """
+    parts = [part.strip() for part in full_name.split(".")]
+    if len(parts) != 3 or not all(parts):
+        return None, "a model service is named <catalog>.<schema>.<model>"
+    catalog, schema, _model = parts
+    normalized = f"{catalog}.{schema}.{_model}"
+    parent = f"schemas/{catalog}.{schema}"
+    hostname = workspace_hostname(workspace)
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        params: dict[str, str] = {"parent": parent, "page_size": str(_MODEL_SERVICES_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
+        payload, reason = _get_model_services_page(url, token)
+        if payload is None:
+            # A 404 means the catalog/schema in the typed name doesn't exist on this workspace, so
+            # neither can the model — a definitive "no". Every other failure (auth, 5xx, network) is
+            # inconclusive: don't block a possibly-valid model on a blip.
+            return (False, reason) if _is_not_found_reason(reason) else (None, reason)
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_services", []):
+            if not isinstance(service, dict):
+                continue
+            name = service.get("name")
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if name.startswith(_MODEL_SERVICE_NAME_PREFIX):
+                name = name[len(_MODEL_SERVICE_NAME_PREFIX) :]
+            if name == normalized:
+                return True, None
+        page_token = data.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    return False, None
 
 
 def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
