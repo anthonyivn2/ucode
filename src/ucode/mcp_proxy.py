@@ -117,13 +117,24 @@ async def _pump(
     source: MemoryObjectReceiveStream,
     dest: MemoryObjectSendStream,
 ) -> None:
-    """Forward every message (or transport exception) from ``source`` to ``dest``.
+    """Forward every message from ``source`` to ``dest``.
 
     The proxy is transport-level: it never inspects or rewrites MCP method
     payloads, so new methods and capabilities pass through untouched."""
     async with source, dest:
         async for message in source:
+            if isinstance(message, Exception):
+                raise message
             await dest.send(message)
+
+
+async def _pump_upstream(
+    source: MemoryObjectReceiveStream,
+    dest: MemoryObjectSendStream,
+) -> None:
+    """Forward upstream messages, failing if the transport closes first."""
+    await _pump(source, dest)
+    raise RuntimeError("upstream MCP transport closed unexpectedly")
 
 
 async def _run(url: str, workspace: str, profile: str | None) -> None:
@@ -132,7 +143,15 @@ async def _run(url: str, workspace: str, profile: str | None) -> None:
     # 2.x-native shape: hand the transport a pre-built AsyncClient carrying our
     # per-request auth. Works on mcp 1.28+ and 2.x; `streamable_http_client`
     # yields a (read, write) pair in both.
-    async with httpx.AsyncClient(auth=auth) as http_client:
+    async with httpx.AsyncClient(
+        auth=auth,
+        timeout=httpx.Timeout(
+            connect=30.0,
+            read=300.0,
+            write=30.0,
+            pool=30.0,
+        ),
+    ) as http_client:
         async with streamable_http_client(url, http_client=http_client) as streams:
             # mcp 1.x yields (read, write, get_session_id); mcp 2.x drops the
             # trailing callback and yields (read, write). Take the first two
@@ -141,8 +160,9 @@ async def _run(url: str, workspace: str, profile: str | None) -> None:
             async with stdio_server() as (stdio_read, stdio_write):
                 # Bidirectional bridge: client stdin -> Databricks, Databricks -> client stdout.
                 async with anyio.create_task_group() as tg:
-                    tg.start_soon(_pump, stdio_read, http_write)
-                    tg.start_soon(_pump, http_read, stdio_write)
+                    tg.start_soon(_pump_upstream, http_read, stdio_write)
+                    await _pump(stdio_read, http_write)
+                    tg.cancel_scope.cancel()
 
 
 def _preflight_token(workspace: str, profile: str | None) -> None:

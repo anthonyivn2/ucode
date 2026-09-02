@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import anyio
@@ -164,6 +165,62 @@ class TestPump:
             return True
 
         assert anyio.run(scenario) is True
+
+    def test_raises_transport_errors(self):
+        async def scenario() -> None:
+            src_send, src_recv = anyio.create_memory_object_stream(1)
+            dst_send, _ = anyio.create_memory_object_stream(1)
+            await src_send.send(httpx.ReadTimeout("upstream timed out"))
+            await src_send.aclose()
+
+            with pytest.raises(httpx.ReadTimeout, match="upstream timed out"):
+                await mcp_proxy._pump(src_recv, dst_send)
+
+        anyio.run(scenario)
+
+    def test_upstream_eof_is_an_error(self):
+        async def scenario() -> None:
+            src_send, src_recv = anyio.create_memory_object_stream(1)
+            dst_send, _ = anyio.create_memory_object_stream(1)
+            await src_send.aclose()
+
+            with pytest.raises(RuntimeError, match="upstream MCP transport closed"):
+                await mcp_proxy._pump_upstream(src_recv, dst_send)
+
+        anyio.run(scenario)
+
+
+def test_run_uses_mcp_http_defaults(monkeypatch):
+    httpx_module = mcp_proxy._httpx()
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StopBridge(Exception):
+        pass
+
+    @asynccontextmanager
+    async def stop_bridge(*args, **kwargs):
+        raise StopBridge
+        yield
+
+    monkeypatch.setattr(httpx_module, "AsyncClient", CapturingClient)
+    monkeypatch.setattr(mcp_proxy, "_build_token_auth", lambda *args: object())
+    monkeypatch.setattr(mcp_proxy, "streamable_http_client", stop_bridge)
+
+    with pytest.raises(StopBridge):
+        anyio.run(mcp_proxy._run, URL, WS, None)
+
+    timeout = captured["timeout"]
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (30.0, 300.0, 30.0, 30.0)
 
 
 class TestServe:
