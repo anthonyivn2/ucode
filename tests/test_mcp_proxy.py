@@ -199,7 +199,9 @@ class TestPump:
             dst_send, _ = anyio.create_memory_object_stream(1)
             await src_send.aclose()
 
-            with pytest.raises(mcp_proxy.ProxyTransportError, match="upstream MCP transport closed"):
+            with pytest.raises(
+                mcp_proxy.ProxyTransportError, match="upstream MCP transport closed"
+            ):
                 await mcp_proxy._pump_upstream(src_recv, dst_send)
 
         anyio.run(scenario)
